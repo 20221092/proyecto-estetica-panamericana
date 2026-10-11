@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "prestart": "npm run migrate:google-auth",
     "start": "node index.js",
+    "predev": "npm run migrate:google-auth",
     "dev": "nodemon index.js",
     "seed:admin": "node scripts/sembrarAdmin.js",
     "seed:regression": "node scripts/sembrarVentasRegresion.js --apply",
@@ -12,6 +14,7 @@
     "verify:clustering": "node scripts/verificarInteraccionesClusteringServicios.js",
     "cleanup:usernames": "node scripts/normalizarUsernamesNulos.js",
     "cleanup:static": "node scripts/limpiarDatosEstaticosSemilla.js",
+    "migrate:google-auth": "node scripts/migrarIndicesGoogleAuth.js",
     "renombrar:colecciones": "node scripts/renombrarColecciones.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -19,11 +22,15 @@
   "author": "",
   "license": "ISC",
   "description": "",
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "cloudinary": "^1.41.3",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
+    "firebase-admin": "^14.5.0",
     "ml-kmeans": "^7.0.1",
     "ml-random-forest": "^2.1.0",
     "mongoose": "^9.1.5",
