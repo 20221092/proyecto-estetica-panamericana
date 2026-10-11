@@ -223,6 +223,7 @@ router.post("/recover", async (req, res) => {
   try {
     const errors = [];
     const { correo } = req.body;
+    const openInMobileApp = normalizeString(req.body.origen).toLowerCase() === "movil";
     validateEmail(correo, errors);
 
     if (errors.length) {
@@ -259,7 +260,7 @@ router.post("/recover", async (req, res) => {
       type: "password_reset",
       expiresInMs: PASSWORD_RESET_EXPIRATION_MS,
     });
-    await sendPasswordResetEmail(user, rawToken);
+    await sendPasswordResetEmail(user, rawToken, { openInMobileApp });
     user.passwordResetSentAt = new Date();
     await user.save();
 
