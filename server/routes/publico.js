@@ -10,6 +10,10 @@ const Service = require("../models/Servicio");
 const CompanyInfo = require("../models/InformacionEmpresa");
 const CarouselSlide = require("../models/DiapositivaCarrusel");
 const Promotion = require("../models/Promocion");
+const {
+  FirebaseAdminConfigurationError,
+  getFirebaseAdminAuth,
+} = require("../config/firebaseAdmin");
 const { hashPassword, verifyPassword } = require("../utils/contrasena");
 const { createToken } = require("../utils/auth");
 const {
@@ -32,6 +36,14 @@ const {
 const { normalizeServiceSegmentInRecord } = require("../utils/serviceSegments");
 
 const router = express.Router();
+
+const INVALID_FIREBASE_TOKEN_CODES = new Set([
+  "auth/argument-error",
+  "auth/id-token-expired",
+  "auth/id-token-revoked",
+  "auth/invalid-id-token",
+  "auth/user-disabled",
+]);
 
 function isValidId(id) {
   return mongoose.Types.ObjectId.isValid(id);
@@ -78,13 +90,23 @@ function normalizeEmail(value) {
   return normalizeString(value).toLowerCase();
 }
 
+function splitGoogleDisplayName(value, email) {
+  const parts = normalizeString(value).split(/\s+/).filter(Boolean);
+  const fallbackName = normalizeString(email.split("@")[0]) || "Cliente";
+  return {
+    nombre: parts.shift() || fallbackName,
+    apellidoPaterno: parts.shift() || "",
+    apellidoMaterno: parts.join(" "),
+  };
+}
+
 function buildUserResponse(user) {
   return {
     id: String(user._id),
     nombre: user.nombre,
     apellidoPaterno: user.apellidoPaterno,
     apellidoMaterno: user.apellidoMaterno,
-    telefono: user.telefono,
+    telefono: user.telefono || "",
     correo: user.correo,
     role: user.role,
     accountStatus: user.accountStatus || ACCOUNT_STATUS.ACTIVE,
@@ -100,6 +122,14 @@ function buildBlockedLoginMessage(user) {
     return "Tu cuenta esta inactiva. Contacta al administrador.";
   }
   return "";
+}
+
+function sendClientSession(res, user, message = "Inicio de sesion con Google correcto.") {
+  return res.json({
+    message,
+    token: createToken({ id: user._id, correo: user.correo, role: user.role }),
+    user: buildUserResponse(user),
+  });
 }
 
 async function resolveTokenUser(token, type) {
@@ -202,6 +232,10 @@ router.post("/login", async (req, res) => {
     return res.status(401).json({ errors: ["Credenciales invalidas."] });
   }
 
+  if (!user.passwordSalt || !user.passwordHash) {
+    return res.status(401).json({ errors: ["Credenciales invalidas."] });
+  }
+
   const isValid = verifyPassword(password, user.passwordSalt, user.passwordHash);
   if (!isValid) {
     return res.status(401).json({ errors: ["Credenciales invalidas."] });
@@ -217,6 +251,134 @@ router.post("/login", async (req, res) => {
     token: createToken({ id: user._id, correo: user.correo, role: user.role }),
     user: buildUserResponse(user),
   });
+});
+
+router.post("/google-login", async (req, res) => {
+  const firebaseIdToken = normalizeString(req.body?.firebaseIdToken);
+  if (!firebaseIdToken || firebaseIdToken.length > 10000) {
+    return res.status(400).json({ errors: ["Token de Firebase invalido."] });
+  }
+
+  let decodedToken;
+  try {
+    decodedToken = await getFirebaseAdminAuth().verifyIdToken(firebaseIdToken, true);
+  } catch (error) {
+    if (error instanceof FirebaseAdminConfigurationError) {
+      console.error("Firebase Admin no esta configurado para el inicio con Google:", error.message);
+      return res.status(503).json({
+        errors: ["El acceso con Google no esta disponible temporalmente."],
+      });
+    }
+
+    if (INVALID_FIREBASE_TOKEN_CODES.has(error?.code)) {
+      console.warn("Firebase rechazo un token de inicio con Google.", error.code);
+      return res.status(401).json({ errors: ["La sesion de Google no es valida."] });
+    }
+
+    console.error("Firebase Admin no pudo verificar el token:", error?.code || error?.message);
+    return res.status(503).json({
+      errors: ["El acceso con Google no esta disponible temporalmente."],
+    });
+  }
+
+  const provider = decodedToken.firebase?.sign_in_provider;
+  const firebaseUid = normalizeString(decodedToken.uid);
+  const email = normalizeEmail(decodedToken.email);
+  if (provider !== "google.com" || !firebaseUid || !email || decodedToken.email_verified !== true) {
+    return res.status(401).json({ errors: ["La cuenta de Google no pudo verificarse."] });
+  }
+
+  try {
+    let user = await User.findOne({ firebaseUid: { $eq: firebaseUid } });
+
+    if (user) {
+      if (user.role !== "client") {
+        return res.status(403).json({
+          errors: ["El acceso con Google esta disponible unicamente para clientes."],
+        });
+      }
+
+      const blockedMessage = buildBlockedLoginMessage(user);
+      if (blockedMessage) {
+        return res.status(403).json({ errors: [blockedMessage] });
+      }
+
+      return sendClientSession(res, user);
+    }
+
+    user = await User.findOne({ correo: { $eq: email } });
+
+    if (user) {
+      if (user.role !== "client") {
+        return res.status(403).json({
+          errors: ["El acceso con Google esta disponible unicamente para clientes."],
+        });
+      }
+
+      const blockedMessage = buildBlockedLoginMessage(user);
+      if (blockedMessage) {
+        return res.status(403).json({ errors: [blockedMessage] });
+      }
+
+      if (user.firebaseUid && user.firebaseUid !== firebaseUid) {
+        return res.status(409).json({
+          errors: ["Este correo ya esta vinculado a otra cuenta de Google."],
+        });
+      }
+
+      user = await User.findOneAndUpdate(
+        {
+          _id: user._id,
+          accountStatus: ACCOUNT_STATUS.ACTIVE,
+          role: "client",
+          $or: [
+            { firebaseUid: { $exists: false } },
+            { firebaseUid: null },
+            { firebaseUid: { $eq: firebaseUid } },
+          ],
+        },
+        { $set: { firebaseUid } },
+        { new: true, runValidators: true },
+      );
+
+      if (!user) {
+        return res.status(409).json({
+          errors: ["La cuenta cambio mientras se vinculaba con Google. Intenta nuevamente."],
+        });
+      }
+    } else {
+      const names = splitGoogleDisplayName(decodedToken.name, email);
+      user = await User.create({
+        ...names,
+        correo: email,
+        firebaseUid,
+        role: "client",
+        accountStatus: ACCOUNT_STATUS.ACTIVE,
+      });
+    }
+
+    return sendClientSession(res, user);
+  } catch (error) {
+    if (error?.code === 11000) {
+      const linkedUser = await User.findOne({ firebaseUid: { $eq: firebaseUid } });
+      if (
+        linkedUser &&
+        linkedUser.role === "client" &&
+        !buildBlockedLoginMessage(linkedUser)
+      ) {
+        return sendClientSession(res, linkedUser);
+      }
+
+      return res.status(409).json({
+        errors: ["La cuenta de Google ya esta vinculada a otro usuario."],
+      });
+    }
+
+    console.error("Error en /api/public/google-login:", error);
+    return res.status(500).json({
+      errors: ["No fue posible completar el inicio de sesion con Google."],
+    });
+  }
 });
 
 router.post("/recover", async (req, res) => {
